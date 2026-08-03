@@ -269,7 +269,7 @@ def draft_answer(client: Anthropic, item: dict, full_text: str) -> str:
     body = full_text if full_text else f"(Only a short preview was available)\n{item['snippet']}"
     user_content = f"Subreddit: r/{item['subreddit']}\nTitle: {item['title']}\n\nBody:\n{body[:3000]}"
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         max_tokens=600,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_content}],
@@ -348,15 +348,16 @@ def main():
 
     for uid, html_body in emails:
         items = parse_alert_email(html_body)
+        email_had_failure = False
         for item in items:
             post_id = extract_post_id(item["url"])
             if post_id in seen:
                 continue
-            new_seen.add(post_id)
 
             settings = SUBREDDIT_CONFIG.get(item["subreddit"], DEFAULT_SUBREDDIT_SETTINGS)
             full_text_for_matching = f"{item['title']} {item['snippet']}"
             if not matches_keywords(full_text_for_matching, settings["strict"], settings["requires_india_signal"]):
+                new_seen.add(post_id)  # not relevant, don't bother re-checking it again
                 continue
 
             full_body = try_fetch_full_post(item["url"])
@@ -366,13 +367,16 @@ def main():
                 answer = draft_answer(client, item, full_body)
             except Exception as e:
                 print(f"[warn] draft failed for {item['url']}: {e}")
-                continue
+                email_had_failure = True
+                continue  # do NOT mark as seen - retry next run
 
             append_to_sheet(ws, item, answer, context_used)
+            new_seen.add(post_id)  # only mark seen after a successful draft
             matched_count += 1
             time.sleep(1)
 
-        processed_uids.append(uid)
+        if not email_had_failure:
+            processed_uids.append(uid)  # only mark read if nothing in it needs a retry
 
     if processed_uids:
         mark_as_read(processed_uids)

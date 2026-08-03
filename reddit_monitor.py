@@ -1,21 +1,35 @@
 """
-ISB / MBA India Reddit Profile-Eval Monitor
---------------------------------------------
-Scans a set of subreddits for new posts that look like profile evaluation,
-application strategy, or admissions consulting questions. Drafts an answer
-for each using the Anthropic API, then logs everything to a Google Sheet
-for manual review before posting.
+ISB / MBA India Reddit Profile-Eval Monitor (v2 - Google Alerts based)
+------------------------------------------------------------------------
+Reddit now blocks direct/automated fetching of its .json and page endpoints
+from server IPs (see README for details). To work around this, this version
+reads Google Alert emails delivered to your Gmail instead of hitting Reddit
+directly. You set up Google Alerts (in your browser, one-time) for searches
+like `site:reddit.com/r/ISB_Aspirants profile OR chances OR GMAT`, and this
+script scans your inbox daily for new alert emails, extracts the Reddit
+links + title/snippet, drafts an answer for relevant ones, and logs
+everything to your Google Sheet.
 
-This script does NOT post anything to Reddit. It only reads public data
-(no Reddit login required) and writes to your Google Sheet.
+Because Google's alert emails only include a short snippet (not the full
+post body), each drafted answer is based on limited context. The sheet
+flags this so you know to open the link and read the full post before
+finalizing/posting.
+
+This script does NOT post anything to Reddit and does NOT modify your
+Gmail except marking processed alert emails as read.
 """
 
 import os
 import re
 import json
 import time
-import requests
+import email
+import imaplib
+from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone
+
+import requests
+from bs4 import BeautifulSoup
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -25,24 +39,19 @@ from anthropic import Anthropic
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Subreddits to monitor, with per-subreddit strictness.
-# "strict": True means we require a stronger keyword match (used for large,
-# general subreddits like MBAIndia where most posts are NOT relevant).
-SUBREDDITS = [
-    {"name": "ISB_Aspirants", "strict": False, "requires_india_signal": False},
-    {"name": "ISBapplications", "strict": False, "requires_india_signal": False},
-    {"name": "MBAIndia", "strict": True, "requires_india_signal": False},
-    # r/MBA is a large, mostly non-India subreddit (MBA abroad in general).
-    # We only want posts from Indian applicants asking about MBA abroad, so
-    # this one additionally requires an "India signal" term to match.
-    {"name": "MBA", "strict": True, "requires_india_signal": True},
-]
+# Per-subreddit handling. "strict" = require a stronger keyword match.
+# "requires_india_signal" = only relevant if an India-related term is present
+# (used for r/MBA, which is a large, mostly non-Indian subreddit).
+SUBREDDIT_CONFIG = {
+    "ISB_Aspirants":   {"strict": False, "requires_india_signal": False},
+    "ISBapplications": {"strict": False, "requires_india_signal": False},
+    "MBAIndia":        {"strict": True,  "requires_india_signal": False},
+    "MBA":             {"strict": True,  "requires_india_signal": True},
+}
+DEFAULT_SUBREDDIT_SETTINGS = {"strict": False, "requires_india_signal": False}
 
-# How many of the newest posts to look at per subreddit, per run.
-POSTS_PER_SUBREDDIT = 25
+ALERT_SENDER = "googlealerts-noreply@google.com"
 
-# Keyword groups. A post is considered a match if its title+body contains
-# at least one term from ANY group (loose) or from MULTIPLE groups (strict).
 KEYWORDS_PROFILE_EVAL = [
     "profile eval", "profile evaluation", "eval my profile", "rate my profile",
     "my chances", "what are my chances", "shortlist chances", "chances of shortlist",
@@ -61,44 +70,158 @@ KEYWORDS_EXEC_PROGRAMS = [
     "pgpx", "epgp", "execmba", "exec mba", "executive mba",
     "sp jain", "s.p. jain", "spjain",
 ]
-
 ALL_GROUPS = [KEYWORDS_PROFILE_EVAL, KEYWORDS_APPLICATION, KEYWORDS_CONSULTING, KEYWORDS_EXEC_PROGRAMS]
 
-# Used only for subreddits where requires_india_signal=True (e.g. r/MBA),
-# to narrow a large general subreddit down to Indian-applicant posts.
 KEYWORDS_INDIA_SIGNAL = [
     "india", "indian", "nri", " iim ", "iim-", "isb ", "isb,", "isb.",
     "hyderabad", "mohali", "bangalore", "delhi", "mumbai", "pune",
 ]
 
-STATE_FILE = "seen_posts.json"  # tracks post IDs already processed, committed to repo
+STATE_FILE = "seen_posts.json"
 
 REDDIT_HEADERS = {
-    "User-Agent": "isb-profile-eval-monitor/1.0 (personal, non-commercial, read-only script)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
 # ---------------------------------------------------------------------------
-# Reddit fetching (public JSON endpoints, no auth needed for read-only)
+# Gmail (IMAP) - fetch Google Alert emails
 # ---------------------------------------------------------------------------
 
-def fetch_new_posts(subreddit: str, limit: int = 25):
-    url = f"https://www.reddit.com/r/{subreddit}/new.json?limit={limit}"
-    resp = requests.get(url, headers=REDDIT_HEADERS, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    posts = []
-    for child in data.get("data", {}).get("children", []):
-        p = child.get("data", {})
-        posts.append({
-            "id": p.get("id"),
-            "title": p.get("title", ""),
-            "selftext": p.get("selftext", ""),
-            "url": f"https://www.reddit.com{p.get('permalink', '')}",
-            "subreddit": subreddit,
-            "created_utc": p.get("created_utc"),
-        })
-    return posts
+def fetch_alert_emails():
+    """Connects to Gmail via IMAP and returns a list of (uid, html_body) for
+    unread Google Alert emails."""
+    gmail_user = os.environ["GMAIL_ADDRESS"]
+    gmail_pass = os.environ["GMAIL_APP_PASSWORD"]
 
+    imap = imaplib.IMAP4_SSL("imap.gmail.com")
+    imap.login(gmail_user, gmail_pass)
+    imap.select("INBOX")
+
+    status, data = imap.search(None, f'(UNSEEN FROM "{ALERT_SENDER}")')
+    if status != "OK":
+        imap.logout()
+        return []
+
+    uids = data[0].split()
+    results = []
+    for uid in uids:
+        status, msg_data = imap.fetch(uid, "(RFC822)")
+        if status != "OK":
+            continue
+        msg = email.message_from_bytes(msg_data[0][1])
+        html_body = _extract_html(msg)
+        if html_body:
+            results.append((uid, html_body))
+
+    imap.logout()
+    return results
+
+
+def mark_as_read(uids):
+    gmail_user = os.environ["GMAIL_ADDRESS"]
+    gmail_pass = os.environ["GMAIL_APP_PASSWORD"]
+    imap = imaplib.IMAP4_SSL("imap.gmail.com")
+    imap.login(gmail_user, gmail_pass)
+    imap.select("INBOX")
+    for uid in uids:
+        imap.store(uid, "+FLAGS", "\\Seen")
+    imap.logout()
+
+
+def _extract_html(msg):
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                charset = part.get_content_charset() or "utf-8"
+                return part.get_payload(decode=True).decode(charset, errors="ignore")
+    else:
+        if msg.get_content_type() == "text/html":
+            charset = msg.get_content_charset() or "utf-8"
+            return msg.get_payload(decode=True).decode(charset, errors="ignore")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Parse Reddit links + snippets out of an alert email
+# ---------------------------------------------------------------------------
+
+def unwrap_google_redirect(url: str) -> str:
+    """Google Alert links look like https://www.google.com/url?q=<real_url>&...
+    Unwraps to the real URL. If it's already a plain URL, returns as-is."""
+    parsed = urlparse(url)
+    if "google.com" in parsed.netloc and parsed.path == "/url":
+        qs = parse_qs(parsed.query)
+        if "q" in qs:
+            return qs["q"][0]
+    return url
+
+
+def extract_subreddit(url: str) -> str:
+    match = re.search(r"reddit\.com/r/([A-Za-z0-9_]+)/", url)
+    return match.group(1) if match else ""
+
+
+def extract_post_id(url: str) -> str:
+    match = re.search(r"/comments/([a-z0-9]+)/", url)
+    return match.group(1) if match else url
+
+
+def parse_alert_email(html_body: str):
+    """Returns a list of dicts: {url, subreddit, title, snippet}."""
+    soup = BeautifulSoup(html_body, "html.parser")
+    items = []
+    seen_urls_in_email = set()
+
+    for a in soup.find_all("a", href=True):
+        real_url = unwrap_google_redirect(a["href"])
+        if "reddit.com/r/" not in real_url or "/comments/" not in real_url:
+            continue
+        if real_url in seen_urls_in_email:
+            continue
+        seen_urls_in_email.add(real_url)
+
+        title = a.get_text(strip=True)
+        if not title:
+            continue
+
+        # Best-effort snippet: look at the text in the parent container,
+        # minus the title itself.
+        snippet = ""
+        parent = a.find_parent(["td", "div", "p"])
+        if parent:
+            parent_text = parent.get_text(" ", strip=True)
+            snippet = parent_text.replace(title, "", 1).strip()
+
+        items.append({
+            "url": real_url,
+            "subreddit": extract_subreddit(real_url),
+            "title": title,
+            "snippet": snippet[:800],
+        })
+
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Best-effort full post fetch (may fail - Reddit blocks a lot of this now)
+# ---------------------------------------------------------------------------
+
+def try_fetch_full_post(url: str):
+    try:
+        resp = requests.get(url.rstrip("/") + ".json", headers=REDDIT_HEADERS, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        post = data[0]["data"]["children"][0]["data"]
+        return post.get("selftext", "")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Keyword matching
+# ---------------------------------------------------------------------------
 
 def matches_keywords(text: str, strict: bool, requires_india_signal: bool = False) -> bool:
     text_lower = text.lower()
@@ -106,10 +229,7 @@ def matches_keywords(text: str, strict: bool, requires_india_signal: bool = Fals
     if requires_india_signal and not any(kw in text_lower for kw in KEYWORDS_INDIA_SIGNAL):
         return False
 
-    group_hits = 0
-    for group in ALL_GROUPS:
-        if any(kw in text_lower for kw in group):
-            group_hits += 1
+    group_hits = sum(1 for group in ALL_GROUPS if any(kw in text_lower for kw in group))
 
     if strict:
         return group_hits >= 2 or any(kw in text_lower for kw in KEYWORDS_PROFILE_EVAL)
@@ -138,11 +258,16 @@ Some questions will be about executive/mid-career programs instead of a fresh fu
 Jain programs. For these, weight your answer toward what actually matters at that career \
 stage: years of work-ex and seniority fit, sponsorship/self-funding and opportunity cost, \
 career pivot vs. acceleration goals, and how the program's peer group and placements suit \
-someone already mid-career -- rather than fresh-graduate profile-building advice."""
+someone already mid-career -- rather than fresh-graduate profile-building advice.
+
+Sometimes you will only have a short snippet/preview of the post, not the full text. If so,
+write the best general answer you can based on the title and snippet, but keep it a bit more
+general/hedged rather than inventing specifics the post never mentioned."""
 
 
-def draft_answer(client: Anthropic, post: dict) -> str:
-    user_content = f"Subreddit: r/{post['subreddit']}\nTitle: {post['title']}\n\nBody:\n{post['selftext'][:3000]}"
+def draft_answer(client: Anthropic, item: dict, full_text: str) -> str:
+    body = full_text if full_text else f"(Only a short preview was available)\n{item['snippet']}"
+    user_content = f"Subreddit: r/{item['subreddit']}\nTitle: {item['title']}\n\nBody:\n{body[:3000]}"
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=600,
@@ -158,7 +283,7 @@ def draft_answer(client: Anthropic, post: dict) -> str:
 # ---------------------------------------------------------------------------
 
 SHEET_HEADERS = ["Date Found", "Subreddit", "Question Title", "Post Link",
-                 "Drafted Answer", "Status", "Date Posted"]
+                 "Drafted Answer", "Context Used", "Status", "Date Posted"]
 
 
 def get_sheet():
@@ -176,20 +301,21 @@ def get_sheet():
     return ws
 
 
-def append_to_sheet(ws, post: dict, answer: str):
+def append_to_sheet(ws, item: dict, answer: str, context_used: str):
     ws.append_row([
         datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        post["subreddit"],
-        post["title"],
-        post["url"],
+        item["subreddit"],
+        item["title"],
+        item["url"],
         answer,
-        "draft",   # you change this to "ready to post" once reviewed
+        context_used,   # "Full post" or "Alert snippet only - verify before posting"
+        "draft",
         "",
     ])
 
 
 # ---------------------------------------------------------------------------
-# State tracking (avoid re-processing the same post)
+# State tracking
 # ---------------------------------------------------------------------------
 
 def load_seen():
@@ -210,37 +336,46 @@ def save_seen(seen_ids):
 
 def main():
     seen = load_seen()
+    new_seen = set(seen)
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     ws = get_sheet()
 
-    new_seen = set(seen)
+    emails = fetch_alert_emails()
+    print(f"Found {len(emails)} new alert email(s).")
+
     matched_count = 0
+    processed_uids = []
 
-    for sub in SUBREDDITS:
-        try:
-            posts = fetch_new_posts(sub["name"], POSTS_PER_SUBREDDIT)
-        except Exception as e:
-            print(f"[warn] failed to fetch r/{sub['name']}: {e}")
-            continue
-
-        for post in posts:
-            if post["id"] in seen:
+    for uid, html_body in emails:
+        items = parse_alert_email(html_body)
+        for item in items:
+            post_id = extract_post_id(item["url"])
+            if post_id in seen:
                 continue
-            new_seen.add(post["id"])
+            new_seen.add(post_id)
 
-            full_text = f"{post['title']} {post['selftext']}"
-            if not matches_keywords(full_text, sub["strict"], sub.get("requires_india_signal", False)):
+            settings = SUBREDDIT_CONFIG.get(item["subreddit"], DEFAULT_SUBREDDIT_SETTINGS)
+            full_text_for_matching = f"{item['title']} {item['snippet']}"
+            if not matches_keywords(full_text_for_matching, settings["strict"], settings["requires_india_signal"]):
                 continue
+
+            full_body = try_fetch_full_post(item["url"])
+            context_used = "Full post" if full_body else "Alert snippet only - verify before posting"
 
             try:
-                answer = draft_answer(client, post)
+                answer = draft_answer(client, item, full_body)
             except Exception as e:
-                print(f"[warn] draft failed for {post['url']}: {e}")
+                print(f"[warn] draft failed for {item['url']}: {e}")
                 continue
 
-            append_to_sheet(ws, post, answer)
+            append_to_sheet(ws, item, answer, context_used)
             matched_count += 1
-            time.sleep(1)  # gentle pacing, avoid hammering the Anthropic API
+            time.sleep(1)
+
+        processed_uids.append(uid)
+
+    if processed_uids:
+        mark_as_read(processed_uids)
 
     save_seen(new_seen)
     print(f"Done. {matched_count} new matched post(s) added to the sheet.")

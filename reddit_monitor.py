@@ -250,8 +250,8 @@ encouraged -- don't sanitize it into polished prose. No corporate language, no "
 framing, no excessive hedging, no overly neat structure (avoid bullet-point-perfect answers \
 unless the question genuinely calls for a list). Where relevant, mention specifics (typical \
 GMAT/GRE bands, work-ex norms, essay/interview expectations) but avoid making up specific \
-stats you are not sure of -- speak in ranges and general patterns instead. Keep the answer to \
-150-250 words. Do not sign off with a name.
+stats you are not sure of -- speak in ranges and general patterns instead. Keep the answer to 80-150 words -- shorter is better here, this needs to read like a quick \
+Reddit reply, not an essay. Do not sign off with a name.
 
 Some questions will be about executive/mid-career programs instead of a fresh full-time MBA \
 -- e.g. ISB PGP, IIM Ahmedabad PGPX, IIM Bangalore EPGP, IIM Calcutta Executive MBA, or SP \
@@ -270,7 +270,7 @@ def draft_answer(client: Anthropic, item: dict, full_text: str) -> str:
     user_content = f"Subreddit: r/{item['subreddit']}\nTitle: {item['title']}\n\nBody:\n{body[:3000]}"
     response = client.messages.create(
         model="claude-sonnet-5",
-        max_tokens=600,
+        max_tokens=350,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_content}],
     )
